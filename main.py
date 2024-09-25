@@ -1,14 +1,24 @@
+import os
+from dotenv import load_dotenv
 from ftp_client import FTPClient
 import logging
 
-def main():
+# Load environment variables from the .env file
+load_dotenv()
 
+def main():
     # Configure logging for the main script
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     logger = logging.getLogger(__name__)
 
+    # Retrieve FTP connection details from environment variables
+    hostname = os.getenv("FTP_HOSTNAME")
+    username = os.getenv("FTP_USERNAME")
+    password = os.getenv("FTP_PASSWORD")
+    use_tls = os.getenv("FTP_USE_TLS", "True").lower() == "true"  # Default to True if not provided
+
     # Initialize FTP client with credentials and connection details
-    ftp_client = FTPClient(hostname="ftp.example.com", username="user", password="pass", use_tls=True)
+    ftp_client = FTPClient(hostname=hostname, username=username, password=password, use_tls=use_tls)
 
     try:
         # Connect to the server
