@@ -47,7 +47,7 @@ def main():
 
         # List files in the remote directory
         logger.info("Listing files in remote directory...")
-        files = ftp_client.list_files("/remote/path/")
+        files = ftp_client.list_files("/remote/path/", only_files=True) # Only list files in the root directory (optional)
         logger.info(f"Files in remote directory: {files}")
 
     except Exception as e:
