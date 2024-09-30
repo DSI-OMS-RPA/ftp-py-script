@@ -45,7 +45,8 @@ class FTPClient:
         self.lock = threading.Lock()  # Ensures thread-safe access to the connection pool
 
         # Set up logging to track client operations
-        self.logger.setLevel(log_level)
+        logging.basicConfig(level=log_level)
+        self.logger = logging.getLogger(__name__)
 
     def _create_connection(self):
         """
