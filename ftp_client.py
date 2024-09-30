@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import hashlib
 import os
 import ftplib
@@ -22,16 +23,17 @@ class FTPClient:
     retry mechanisms, transfer progress tracking, and parallel file transfers.
     """
 
-    def __init__(self, hostname, username, password, use_tls=True, max_connections=5, timeout=10):
+    def __init__(self, hostname, username, password, use_tls=False, max_connections=5, timeout=10, log_level=logging.INFO):
         """
         Initializes the FTPClient with server credentials and connection settings.
 
         :param hostname: The FTP server hostname.
         :param username: FTP account username.
         :param password: FTP account password.
-        :param use_tls: Whether to use FTPS (TLS) or plain FTP. Default is True (use FTPS).
+        :param use_tls: Whether to use FTPS (TLS) or plain FTP. Default is False (use FTPS).
         :param max_connections: Maximum number of FTP connections to pool.
         :param timeout: Timeout for the FTP connections in seconds.
+        :param log_level: Level of logging (default is INFO).
         """
         self.hostname = hostname
         self.username = username
@@ -43,8 +45,7 @@ class FTPClient:
         self.lock = threading.Lock()  # Ensures thread-safe access to the connection pool
 
         # Set up logging to track client operations
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(log_level)
 
     def _create_connection(self):
         """
@@ -89,6 +90,14 @@ class FTPClient:
             else:
                 conn.quit()  # Close the connection if the pool is full
 
+    @contextmanager
+    def ftp_connection(self):
+        conn = self._get_connection()
+        try:
+            yield conn
+        finally:
+            self._release_connection(conn)
+
     def connect(self):
         """
         Pre-warm the connection pool by establishing a set number of FTP connections.
@@ -115,21 +124,22 @@ class FTPClient:
         :param progress_callback: Optional callback for progress tracking.
         :raises FTPTransferError: If the file upload fails after retries.
         """
-        try:
-            ftp = self._get_connection()
+        with self.ftp_connection() as ftp:
+            try:
+                with open(local_file_path, 'rb') as file:
+                    total_size = os.path.getsize(local_file_path)
+                    # Display a progress bar while uploading
+                    with tqdm(total=total_size, unit='B', unit_scale=True, desc="Uploading") as pbar:
+                        def progress_callback(block):
+                            pbar.update(len(block))
+                        ftp.storbinary(f"STOR {remote_file_path}", file, callback=progress_callback)
 
-            with open(local_file_path, 'rb') as file:
-                total_size = os.path.getsize(local_file_path)
-                # Display a progress bar while uploading
-                with tqdm(total=total_size, unit='B', unit_scale=True, desc="Uploading") as pbar:
-                    def progress_callback(block):
-                        pbar.update(len(block))
-                    ftp.storbinary(f"STOR {remote_file_path}", file, callback=progress_callback)
-
-            self.logger.info(f"Uploaded: {local_file_path} to {remote_file_path}")
-            self._release_connection(ftp)
-        except Exception as e:
-            raise FTPTransferError(f"Failed to upload file {local_file_path}: {e}")
+                self.logger.info(f"Uploaded: {local_file_path} to {remote_file_path}")
+                self._release_connection(ftp)
+            except Exception as e:
+                raise FTPTransferError(f"Failed to upload file {local_file_path}: {e}")
+            finally:
+                self._release_connection(ftp)
 
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
     def download_file(self, remote_file_path, local_file_path, progress_callback=None):
@@ -158,22 +168,41 @@ class FTPClient:
         except Exception as e:
             raise FTPTransferError(f"Failed to download file {remote_file_path}: {e}")
 
-    def list_files(self, remote_path):
+    def list_files(self, remote_path, only_files=True):
         """
         Lists the files in a specified directory on the FTP server.
 
         :param remote_path: The directory path on the remote server.
+        :param only_files: Whether to list only files (True) or include both files and directories (False).
         :return: A list of filenames in the directory.
         :raises FTPTransferError: If listing files fails.
         """
         try:
             ftp = self._get_connection()
-            files = ftp.nlst(remote_path)  # List files in the directory
+            files = ftp.nlst(remote_path)  # List files and directories in the directory
+            if only_files:
+                files = [f for f in files if not self._is_directory(ftp, f)]  # Filter out directories
+
             self._release_connection(ftp)
             return files
         except Exception as e:
             raise FTPTransferError(f"Failed to list files in {remote_path}: {e}")
 
+    def _is_directory(self, ftp, item):
+        """
+        Checks if the given item is a directory.
+
+        :param ftp: The FTP connection.
+        :param item: The item path to check.
+        :return: True if the item is a directory, False otherwise.
+        """
+        current = ftp.pwd()  # Save the current working directory
+        try:
+            ftp.cwd(item)  # Try to change to the item as if it were a directory
+            ftp.cwd(current)  # Change back to the original directory
+            return True
+        except ftplib.error_perm:  # If permission is denied, it's a file
+            return False
 
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
     def rename_file(self, old_remote_path, new_remote_path):
