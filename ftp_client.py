@@ -175,7 +175,7 @@ class FTPClient:
 
         :param remote_path: The directory path on the remote server.
         :param only_files: Whether to list only files (True) or include both files and directories (False).
-        :return: A list of filenames in the directory.
+        :return: A list of filenames in the directory or an empty list if the directory is empty.
         :raises FTPTransferError: If listing files fails.
         """
         try:
@@ -186,7 +186,10 @@ class FTPClient:
 
             self._release_connection(ftp)
             return files
-        except Exception as e:
+        except ftplib.error_perm as e:
+            if str(e).startswith("550"):  # Handle empty directory
+                self.logger.warning(f"Directory {remote_path} is empty or not accessible.")
+                return []  # Return empty list for empty directory
             raise FTPTransferError(f"Failed to list files in {remote_path}: {e}")
 
     def _is_directory(self, ftp, item):
@@ -203,6 +206,21 @@ class FTPClient:
             ftp.cwd(current)  # Change back to the original directory
             return True
         except ftplib.error_perm:  # If permission is denied, it's a file
+            return False
+
+    def directory_exists(self, remote_path):
+        """
+        Checks if a directory exists on the FTP server.
+
+        :param remote_path: The path of the remote directory to check.
+        :return: True if the directory exists, False otherwise.
+        """
+        try:
+            ftp = self._get_connection()
+            ftp.cwd(remote_path)
+            self._release_connection(ftp)
+            return True
+        except ftplib.error_perm:
             return False
 
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
