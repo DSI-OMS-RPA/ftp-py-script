@@ -125,8 +125,50 @@ class FTPClient:
         """
         while self.connection_pool:
             conn = self.connection_pool.pop()
-            conn.quit()  # Close each connection in the pool
+            try:
+                conn.quit()  # Close each connection in the pool
+                self.logger.info("Connection closed successfully.")
+            except (ftplib.error_temp, ConnectionResetError) as e:
+                # Handle errors when the connection is already closed or reset
+                self.logger.warning(f"Connection already closed or reset: {e}")
+            except Exception as e:
+                # Catch any other unexpected exceptions
+                self.logger.error(f"Error while closing FTP connection: {e}")
         self.logger.info("Disconnected from FTP server.")
+
+    def keep_alive(self, ftp):
+        """
+        Sends a NOOP command to keep the FTP connection alive.
+        If the connection is closed, it tries to reconnect.
+
+        :param ftp: The FTP connection to keep alive.
+        :raises FTPConnectionError: If unable to keep the connection alive or reconnect.
+        """
+        try:
+            # Attempt to send NOOP to keep the connection alive
+            ftp.voidcmd("NOOP")
+            self.logger.info("Sent NOOP to keep the connection alive.")
+        except (ftplib.error_temp, ftplib.error_perm, ConnectionResetError) as e:
+            # Handle connection closure or reset by attempting to reconnect
+            self.logger.warning(f"Connection issue: {e}. Trying to reconnect.")
+            try:
+                # Re-establish the connection
+                ftp = self._create_connection()
+                self.logger.info("Reconnected successfully.")
+            except Exception as e:
+                # If reconnection fails, raise a custom connection error
+                raise FTPConnectionError(f"Failed to reconnect after NOOP failure: {e}")
+        except Exception as e:
+            # Catch other unknown errors
+            self.logger.error(f"Unexpected error while sending NOOP: {e}")
+            raise FTPConnectionError(f"Failed to send NOOP: {e}")
+
+    def periodic_keep_alive(self, ftp, interval=300):
+        """
+        Periodically sends NOOP to keep the FTP connection alive every `interval` seconds.
+        """
+        self.keep_alive(ftp)
+        threading.Timer(interval, self.periodic_keep_alive, args=[ftp, interval]).start()
 
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
     def upload_file(self, local_file_path, remote_file_path, progress_callback=None, auto_release=True):
@@ -157,7 +199,6 @@ class FTPClient:
                 self.logger.warning(f"Retry attempt for file upload: {local_file_path}")
                 raise FTPTransferError(f"Failed to upload file {local_file_path}: {e}")
 
-
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
     def download_file(self, remote_file_path, local_file_path, progress_callback=None, auto_release=True):
         """
@@ -173,27 +214,26 @@ class FTPClient:
 
         try:
             with self.ftp_connection(auto_release) as ftp:
+                total_size = ftp.size(remote_file_path)
+
                 # Open the local file in write-binary mode
                 with open(local_file_path, 'wb') as file:
-                    total_size = ftp.size(remote_file_path)
-
-                    # Default progress tracking using tqdm if no callback is provided
                     if progress_callback is None:
                         with tqdm(total=total_size, unit='B', unit_scale=True, desc="Downloading") as pbar:
                             def progress_callback(data):
                                 file.write(data)
                                 pbar.update(len(data))
+                                # Call keep_alive periodically to keep the connection alive
+                                self.keep_alive(ftp)
                     else:
-                        # Custom progress callback
                         def progress_callback(data):
                             file.write(data)
-                            if progress_callback:
-                                progress_callback(len(data))
+                            progress_callback(len(data))
+                            # Call keep_alive periodically to keep the connection alive
+                            self.keep_alive(ftp)
 
-                    # Download the file using RETR command
                     ftp.retrbinary(f"RETR {remote_file_path}", progress_callback)
 
-                # Check if the file was actually downloaded
                 local_file_size = os.path.getsize(local_file_path)
                 if local_file_size == 0:
                     raise FTPTransferError(f"Downloaded file {local_file_path} is empty (0KB)")
