@@ -24,21 +24,25 @@ class FTPClient:
     retry mechanisms, transfer progress tracking, and parallel file transfers.
     """
 
-    def __init__(self, hostname, username, password, use_tls=False, max_connections=5, timeout=10, log_level=logging.INFO, retry_attempts=5, retry_multiplier=1000, retry_max=10000):
+    def __init__(self, hostname, username, password, port, use_tls=False, max_connections=5, timeout=10, log_level=logging.INFO, retry_attempts=5, retry_multiplier=1000, retry_max=10000):
         """
         Initializes the FTPClient with server credentials and connection settings.
 
         :param hostname: The FTP server hostname.
         :param username: FTP account username.
         :param password: FTP account password.
+        :param port: Port number for the FTP server.
         :param use_tls: Whether to use FTPS (TLS) or plain FTP. Default is False (use FTPS).
         :param max_connections: Maximum number of FTP connections to pool.
         :param timeout: Timeout for the FTP connections in seconds.
         :param log_level: Level of logging (default is INFO).
+        :param retry_attempts: Number of retry attempts for failed operations.
+        :param retry_max: Maximum time between retries in milliseconds.
         """
         self.hostname = hostname
         self.username = username
         self.password = password
+        self.port = int(port)
         self.use_tls = use_tls
         self.timeout = timeout
         self.connection_pool = []  # Pool of reusable FTP connections
@@ -53,6 +57,7 @@ class FTPClient:
         logging.basicConfig(level=log_level)
         self.logger = logging.getLogger(__name__)
 
+    @retry(stop_max_attempt_number=5, wait_fixed=2000)  # Retry up to 5 times, waiting 2 seconds between tries
     def _create_connection(self):
         """
         Creates a new FTP or FTPS connection.
@@ -61,16 +66,18 @@ class FTPClient:
         :raises FTPConnectionError: If connection to the server fails.
         """
         try:
+            ftp = ftplib.FTP_TLS(timeout=self.timeout) if self.use_tls else ftplib.FTP(timeout=self.timeout)
+            ftp.connect(self.hostname, self.port)
+            ftp.login(self.username, self.password)
             if self.use_tls:
-                ftp = ftplib.FTP_TLS(self.hostname, timeout=self.timeout)
-                ftp.login(self.username, self.password)
-                ftp.prot_p()  # Switch to secure data connection
-            else:
-                ftp = ftplib.FTP(self.hostname, timeout=self.timeout)
-                ftp.login(self.username, self.password)
+                ftp.prot_p()
             return ftp
+        except TimeoutError:
+            self.logger.error("Connection attempt timed out, retrying...")
+            raise FTPConnectionError("Timeout error while connecting to FTP server.")
         except Exception as e:
             raise FTPConnectionError(f"Error connecting to FTP server: {e}")
+
 
     def _get_connection(self):
         """
