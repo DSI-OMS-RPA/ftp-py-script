@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from ftp_client import FTPClient
+from ftp_client import FTPClient, TransferProtocol, OverwriteAction
 import logging
 
 # Load environment variables from the .env file
@@ -29,7 +29,15 @@ def main():
         return
 
     # Initialize FTP client with credentials and connection details
-    ftp_client = FTPClient(hostname=hostname, username=username, password=password, use_tls=use_tls)
+    ftp_client = FTPClient(
+        hostname=hostname,
+        username=username,
+        password=password,
+        protocol=TransferProtocol.SFTP,
+        max_connections=1,
+        use_tls=use_tls,
+        timeout=30
+    )
 
     try:
         # Connect to the server
@@ -44,6 +52,11 @@ def main():
         logger.info("Downloading file...")
         ftp_client.download_file("/remote/path/file.txt", "local/path/to/file.txt")
         logger.info("File downloaded successfully.")
+
+        # Download a file with pattern matching
+        logger.info("Downloading file with pattern matching...")
+        ftp_client.download_matching_files("/remote/path/", "file.txt", "local/path/to/", OverwriteAction.OVERWRITE)
+        logger.info("File downloaded successfully with pattern matching.")
 
         # List files in the remote directory
         logger.info("Listing files in remote directory...")

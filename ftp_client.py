@@ -1,13 +1,33 @@
-from datetime import datetime
 import os
+import re
+import stat
 import ftplib
 import hashlib
+import paramiko
+import fnmatch
+from pathlib import Path
+from datetime import datetime
+from enum import Enum
+from typing import Callable, List, Optional, Union, Pattern
 from retrying import retry  # To handle retrying failed operations
 import threading  # For thread-safe connection pool
 import logging  # For logging errors and information
 from tqdm import tqdm  # For tracking progress
 from contextlib import contextmanager
+from ratelimit import limits, sleep_and_retry
 from concurrent.futures import ThreadPoolExecutor  # For parallel file transfers
+
+class TransferProtocol(Enum):
+    """Enum for supported file transfer protocols"""
+    FTP = "FTP"
+    FTPS = "FTPS"
+    SFTP = "SFTP"
+
+class OverwriteAction(Enum):
+    """Enum for file overwrite actions"""
+    SKIP = "skip"  # Skip if file exists
+    OVERWRITE = "overwrite"  # Always overwrite existing files
+    RENAME = "rename"  # Rename new file if exists (append timestamp)
 
 # Custom exceptions for FTP errors
 class FTPConnectionError(Exception):
@@ -24,60 +44,147 @@ class FTPClient:
     retry mechanisms, transfer progress tracking, and parallel file transfers.
     """
 
-    def __init__(self, hostname, username, password, port, use_tls=False, max_connections=5, timeout=10, log_level=logging.INFO, retry_attempts=5, retry_multiplier=1000, retry_max=10000):
+    def __init__(
+        self,
+        hostname: str,
+        username: str,
+        password: str,
+        port: int = None,
+        use_tls=False,
+        protocol: TransferProtocol = TransferProtocol.FTP,
+        max_connections: int = 5,
+        timeout: int = 30,
+        log_level: int = logging.INFO,
+        retry_attempts: int = 5,
+        retry_multiplier: int = 1000,
+        retry_max: int = 10000,
+        use_passive_mode: bool = True
+    ):
+
         """
         Initializes the FTPClient with server credentials and connection settings.
 
         :param hostname: The FTP server hostname.
         :param username: FTP account username.
         :param password: FTP account password.
-        :param port: Port number for the FTP server.
+        :param protocol: Transfer protocol (FTP, FTPS, or SFTP)
+        :param port: Server port (default: 21 for FTP/FTPS, 22 for SFTP)
         :param use_tls: Whether to use FTPS (TLS) or plain FTP. Default is False (use FTPS).
         :param max_connections: Maximum number of FTP connections to pool.
         :param timeout: Timeout for the FTP connections in seconds.
         :param log_level: Level of logging (default is INFO).
-        :param retry_attempts: Number of retry attempts for failed operations.
-        :param retry_max: Maximum time between retries in milliseconds.
         """
+
+        if max_connections <= 0:
+            raise ValueError("max_connections must be positive")
+
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
+
         self.hostname = hostname
         self.username = username
         self.password = password
-        self.port = int(port)
+
+        # Set default ports based on protocol if not specified
+        if port is None:
+            self.port = 22 if protocol == TransferProtocol.SFTP else 21
+        else:
+            self.port = int(port)
+
+        self.protocol = protocol
         self.use_tls = use_tls
         self.timeout = timeout
+        self.use_passive_mode = use_passive_mode
         self.connection_pool = []  # Pool of reusable FTP connections
         self.max_connections = max_connections
         self.lock = threading.Lock()  # Ensures thread-safe access to the connection pool
 
+        # Retry settings for FTP operations
         self.retry_attempts = retry_attempts
         self.retry_multiplier = retry_multiplier
         self.retry_max = retry_max
+
+        # For SFTP connections
+        self.ssh = None
+        self.sftp = None
 
         # Set up logging to track client operations
         logging.basicConfig(level=log_level)
         self.logger = logging.getLogger(__name__)
 
-    @retry(stop_max_attempt_number=5, wait_fixed=2000)  # Retry up to 5 times, waiting 2 seconds between tries
     def _create_connection(self):
-        """
-        Creates a new FTP or FTPS connection.
-
-        :return: A new FTP or FTPS connection.
-        :raises FTPConnectionError: If connection to the server fails.
-        """
+        """Creates new connection based on protocol type."""
         try:
-            ftp = ftplib.FTP_TLS(timeout=self.timeout) if self.use_tls else ftplib.FTP(timeout=self.timeout)
-            ftp.connect(self.hostname, self.port)
-            ftp.login(self.username, self.password)
-            if self.use_tls:
-                ftp.prot_p()
-            return ftp
-        except TimeoutError:
-            self.logger.error("Connection attempt timed out, retrying...")
-            raise FTPConnectionError("Timeout error while connecting to FTP server.")
+            if self.protocol == TransferProtocol.SFTP:
+                return self._create_sftp_connection()
+            else:
+                return self._create_ftp_connection()
         except Exception as e:
-            raise FTPConnectionError(f"Error connecting to FTP server: {e}")
+            self.logger.error(f"Connection failed: {str(e)}")
+            raise FTPConnectionError(f"Connection failed: {str(e)}")
 
+    def _create_sftp_connection(self):
+        """Creates a new SFTP connection."""
+        try:
+            self.logger.info(f"Attempting SFTP connection to {self.hostname}:{self.port}")
+
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            ssh.connect(
+                self.hostname,
+                port=self.port,
+                username=self.username,
+                password=self.password,
+                timeout=self.timeout
+            )
+
+            sftp = ssh.open_sftp()
+            return {'ssh': ssh, 'sftp': sftp}
+
+        except Exception as e:
+            raise FTPConnectionError(f"SFTP connection failed: {str(e)}")
+
+    def _create_ftp_connection(self):
+        """Creates a new FTP or FTPS connection."""
+        try:
+            ftp = ftplib.FTP_TLS(timeout=self.timeout) if self.protocol == TransferProtocol.FTPS else ftplib.FTP(timeout=self.timeout)
+            ftp.set_debuglevel(2)
+
+            self.logger.info(f"Attempting FTP/FTPS connection to {self.hostname}:{self.port}")
+            ftp.connect(self.hostname, self.port)
+
+            if self.use_passive_mode:
+                self.logger.info("Setting passive mode")
+                ftp.set_pasv(True)
+
+            ftp.login(self.username, self.password)
+
+            if self.protocol == TransferProtocol.FTPS:
+                self.logger.info("Setting up TLS protection")
+                ftp.prot_p()
+
+            return ftp
+
+        except Exception as e:
+            raise FTPConnectionError(f"FTP/FTPS connection failed: {str(e)}")
+
+    def toggle_transfer_mode(self, use_passive_mode: bool) -> None:
+        """
+        Toggles between active and passive mode for data transfers.
+
+        Args:
+            use_passive_mode: True for passive mode, False for active mode
+        """
+        self.use_passive_mode = use_passive_mode
+
+        # Update existing connections in the pool
+        with self.lock:
+            for conn in self.connection_pool:
+                try:
+                    conn.set_pasv(use_passive_mode)
+                except Exception as e:
+                    self.logger.warning(f"Failed to update transfer mode for connection: {e}")
 
     def _get_connection(self):
         """
@@ -86,16 +193,27 @@ class FTPClient:
         :return: An FTP connection.
         """
         with self.lock:
-            if len(self.connection_pool) > 0:
-                conn = self.connection_pool.pop()
-                # Check if the connection is still alive
+            if self.protocol == TransferProtocol.SFTP:
+                # For SFTP, use single connection
+                if not self.connection_pool:
+                    return self._create_connection()
+                conn = self.connection_pool[0]
                 try:
-                    conn.voidcmd("NOOP")  # Send a NOOP command to keep the connection alive
+                    conn['sftp'].stat('.')  # Test connection
+                    return conn
                 except Exception:
-                    self.logger.warning("Recreating a dropped FTP connection.")
-                    conn = self._create_connection()  # Recreate if the connection is broken
-                return conn
+                    self.logger.warning("Recreating dropped SFTP connection")
+                    return self._create_connection()
             else:
+                # For FTP/FTPS, use connection pool
+                if self.connection_pool:
+                    conn = self.connection_pool.pop()
+                    try:
+                        conn.voidcmd("NOOP")
+                        return conn
+                    except Exception:
+                        self.logger.warning("Recreating dropped FTP connection")
+                        return self._create_connection()
                 return self._create_connection()
 
     def _release_connection(self, conn, auto_release=True):
@@ -107,10 +225,27 @@ class FTPClient:
         """
         if auto_release:
             with self.lock:
-                if len(self.connection_pool) < self.max_connections:
-                    self.connection_pool.append(conn)
+                if self.protocol == TransferProtocol.SFTP:
+                    # For SFTP, keep single connection
+                    if not self.connection_pool:
+                        self.connection_pool = [conn]
                 else:
-                    conn.quit()  # Close the connection if the pool is full
+                    # For FTP/FTPS, manage connection pool
+                    if len(self.connection_pool) < self.max_connections:
+                        self.connection_pool.append(conn)
+                    else:
+                        self._close_connection(conn)
+
+    def _close_connection(self, conn):
+        """Closes a connection based on protocol type."""
+        try:
+            if self.protocol == TransferProtocol.SFTP:
+                conn['sftp'].close()
+                conn['ssh'].close()
+            else:
+                conn.quit()
+        except Exception as e:
+            self.logger.warning(f"Error closing connection: {e}")
 
     @contextmanager
     def ftp_connection(self, auto_release=True):
@@ -120,12 +255,30 @@ class FTPClient:
         finally:
             self._release_connection(conn, auto_release)
 
+    @contextmanager
+    def get_connection(self, auto_release=True):
+        """Context manager for connections."""
+        conn = self._get_connection()
+        try:
+            yield conn
+        finally:
+            self._release_connection(conn, auto_release)
+
     def connect(self):
         """
-        Pre-warm the connection pool by establishing a set number of FTP connections.
+        Initialize connection based on protocol type.
+        For SFTP, create single connection. For FTP/FTPS, pre-warm connection pool.
         """
-        for _ in range(self.max_connections):
-            self.connection_pool.append(self._create_connection())
+        if self.protocol == TransferProtocol.SFTP:
+            # For SFTP, maintain single connection
+            conn = self._create_connection()
+            self.connection_pool = [conn]
+            self.logger.info("SFTP connection established")
+        else:
+            # For FTP/FTPS, pre-warm the connection pool
+            for _ in range(self.max_connections):
+                self.connection_pool.append(self._create_connection())
+            self.logger.info(f"{len(self.connection_pool)} FTP connections established")
 
     def disconnect(self):
         """
@@ -134,7 +287,7 @@ class FTPClient:
         while self.connection_pool:
             conn = self.connection_pool.pop()
             try:
-                conn.quit()  # Close each connection in the pool
+                self._close_connection(conn)  # Close each connection in the pool
                 self.logger.info("Connection closed successfully.")
             except (ftplib.error_temp, ConnectionResetError) as e:
                 # Handle errors when the connection is already closed or reset
@@ -144,54 +297,164 @@ class FTPClient:
                 self.logger.error(f"Error while closing FTP connection: {e}")
         self.logger.info("Disconnected from FTP server.")
 
-
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
-    def download_file(self, remote_file_path, local_file_path, progress_callback=None, auto_release=True):
+    def download_file(self, remote_path, local_path, progress_callback=None, auto_release=True):
         """
         Downloads a file from the FTP server with retry and progress tracking.
 
-        :param remote_file_path: Path to the file on the FTP server.
-        :param local_file_path: Local path where the downloaded file will be stored.
+        :param remote_path: Path to the file on the FTP server.
+        :param local_path: Local path where the downloaded file will be stored.
         :param progress_callback: Optional callback for progress tracking.
         :param auto_release: Whether to release the FTP connection after the download.
         :raises FTPTransferError: If the file download fails after retries.
         """
-        self.logger.info(f"Starting download of {remote_file_path} to {local_file_path}")
+        self.logger.info(f"Starting download of {remote_path} to {local_path}")
 
         try:
-            with self.ftp_connection(auto_release) as ftp:
-                total_size = ftp.size(remote_file_path)
+
+            # Get the file size for progress tracking
+            with self.get_connection(auto_release) as conn:
+                if self.protocol == TransferProtocol.SFTP:
+                    file_size = conn['sftp'].stat(remote_path).st_size
+                else:
+                    file_size = conn.size(remote_path)
 
                 # Open the local file in write-binary mode
-                with open(local_file_path, 'wb') as file:
-                    if progress_callback is None:
-                        with tqdm(total=total_size, unit='B', unit_scale=True, desc="Downloading") as pbar:
-                            def progress_callback(data):
-                                file.write(data)
-                                pbar.update(len(data))
-                                # Call keep_alive periodically to keep the connection alive
-                                self.keep_alive(ftp)
+                with tqdm(total=file_size, unit='B', unit_scale=True, desc=f"Downloading {os.path.basename(remote_path)}") as pbar:
+
+                    # Default progress tracking using tqdm if no callback is provided
+                    def update_progress(sent, total=None):
+                        pbar.update(sent - pbar.n)
+
+                    # Custom progress callback
+                    if self.protocol == TransferProtocol.SFTP:
+                        conn['sftp'].get(
+                            remote_path,
+                            local_path,
+                            callback=update_progress if not progress_callback else progress_callback
+                        )
                     else:
-                        def progress_callback(data):
-                            file.write(data)
-                            progress_callback(len(data))
-                            # Call keep_alive periodically to keep the connection alive
-                            self.keep_alive(ftp)
+                        with open(local_path, 'wb') as file:
+                            conn.retrbinary(
+                                f"RETR {remote_path}",
+                                lambda data: (file.write(data), update_progress(len(data)))[0]
+                            )
 
-                    ftp.retrbinary(f"RETR {remote_file_path}", progress_callback)
+            self.logger.info(f"Downloaded: {remote_path} to {local_path}")
 
-                local_file_size = os.path.getsize(local_file_path)
-                if local_file_size == 0:
-                    raise FTPTransferError(f"Downloaded file {local_file_path} is empty (0KB)")
-
-                self.logger.info(f"Downloaded: {remote_file_path} to {local_file_path}")
-
-        except ftplib.error_perm as e:
-            if str(e).startswith("550"):
-                self.logger.error(f"File not found on server: {remote_file_path}")
-            raise FTPTransferError(f"Failed to download file {remote_file_path}: {e}")
         except Exception as e:
-            raise FTPTransferError(f"Error during download: {e}")
+            raise FTPTransferError(f"Download failed: {str(e)}")
+
+    def download_matching_files(
+        self,
+        local_directory: str,
+        remote_directory: str,
+        filemask: str = "*",
+        overwrite_action: Union[OverwriteAction, str] = OverwriteAction.SKIP,
+        logger: Optional[logging.Logger] = None
+    ) -> List[str]:
+        """
+        Downloads files from FTP server matching specified criteria, similar to Talend's tFTPGet component.
+
+        Args:
+            ftp_client: Instance of FTPClient class
+            local_directory: Local directory where files will be downloaded
+            remote_directory: Remote FTP directory from which to download files
+            filemask: Wildcard pattern or regex pattern for file filtering (default: "*")
+            overwrite_action: Action to take when file exists (skip/overwrite/rename)
+            logger: Optional logger instance for logging operations
+
+        Returns:
+            List[str]: List of successfully downloaded file paths
+
+        Raises:
+            ValueError: If invalid parameters are provided
+            FTPTransferError: If FTP operations fail
+        """
+        # Set up logging
+        if logger is None:
+            logger = logging.getLogger(__name__)
+            logger.setLevel(logging.INFO)
+
+        # Validate and normalize inputs
+        if not os.path.exists(local_directory):
+            os.makedirs(local_directory)
+
+        local_directory = os.path.abspath(local_directory)
+
+        # Convert string overwrite_action to enum if necessary
+        if isinstance(overwrite_action, str):
+            try:
+                overwrite_action = OverwriteAction(overwrite_action.lower())
+            except ValueError:
+                raise ValueError(f"Invalid overwrite_action: {overwrite_action}. Must be one of: {[a.value for a in OverwriteAction]}")
+
+        # Determine if filemask is regex or wildcard
+        is_regex = any(c in filemask for c in "[]()+{}^$")
+        if is_regex:
+            try:
+                pattern = re.compile(filemask)
+            except re.error:
+                raise ValueError(f"Invalid regex pattern: {filemask}")
+        else:
+            # Convert wildcard to regex
+            pattern = re.compile(fnmatch.translate(filemask))
+
+        downloaded_files = []
+
+        try:
+            # List all files in remote directory
+            remote_files = self.list_files(remote_directory)
+
+            # Filter files based on mask
+            matching_files = [
+                f for f in remote_files
+                if pattern.match(os.path.basename(f))
+            ]
+
+            if not matching_files:
+                logger.info(f"No files matching pattern '{filemask}' found in {remote_directory}")
+                return downloaded_files
+
+            # Process each matching file
+            for remote_file in matching_files:
+                remote_path = os.path.join(remote_directory, remote_file)
+                local_path = os.path.join(local_directory, os.path.basename(remote_file))
+
+                try:
+                    # Check if local file exists
+                    if os.path.exists(local_path):
+                        if overwrite_action == OverwriteAction.SKIP:
+                            logger.info(f"Skipping existing file: {local_path}")
+                            continue
+                        elif overwrite_action == OverwriteAction.RENAME:
+                            # Generate new filename with timestamp
+                            base, ext = os.path.splitext(local_path)
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            local_path = f"{base}_{timestamp}{ext}"
+                            logger.info(f"Renaming to avoid conflict: {local_path}")
+                        # For OVERWRITE, we'll just proceed with the download
+
+                    # Download the file
+                    logger.info(f"Downloading {remote_path} to {local_path}")
+                    self.download_file(remote_path, local_path)
+
+                    # Verify the download
+                    if self.check_file_exists(remote_path):
+                        downloaded_files.append(local_path)
+                        logger.info(f"Successfully downloaded: {local_path}")
+                    else:
+                        logger.error(f"Failed to verify download: {local_path}")
+
+                except Exception as e:
+                    logger.error(f"Error downloading {remote_path}: {str(e)}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Error during FTP GET operation: {str(e)}")
+            raise
+
+        return downloaded_files
 
     def periodic_keep_alive(self, ftp, interval=300):
         """
@@ -200,87 +463,58 @@ class FTPClient:
         self.keep_alive(ftp)
         threading.Timer(interval, self.periodic_keep_alive, args=[ftp, interval]).start()
 
+    @sleep_and_retry
+    @limits(calls=100, period=60)  # 100 calls per minute
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
-    def upload_file(self, local_file_path, remote_file_path, progress_callback=None, auto_release=True):
+    def upload_file(
+        self,
+        local_path: str,
+        remote_path: str,
+        progress_callback: Optional[Callable[[int], None]] = None,
+        auto_release: bool = True
+    ) -> None:
         """
         Uploads a file to the FTP server with retry and progress tracking.
 
-        :param local_file_path: Path to the local file to be uploaded.
-        :param remote_file_path: Path on the remote server where the file will be stored.
+        :param local_path: Path to the local file to be uploaded.
+        :param remote_path: Path on the remote server where the file will be stored.
         :param progress_callback: Optional callback for progress tracking.
         :param auto_release: Whether to release the FTP connection after the upload.
         :raises FTPTransferError: If the file upload fails after retries.
         """
-        self.logger.info(f"Starting upload of {local_file_path} to {remote_file_path}")
-        with self.ftp_connection(auto_release) as ftp:
-            try:
-                with open(local_file_path, 'rb') as file:
-                    total_size = os.path.getsize(local_file_path)
-                    # Display a progress bar if no callback is provided
-                    if progress_callback is None:
-                        with tqdm(total=total_size, unit='B', unit_scale=True, desc="Uploading") as pbar:
-                            def progress_callback(block):
-                                pbar.update(len(block))
-
-                    ftp.storbinary(f"STOR {remote_file_path}", file, callback=progress_callback)
-
-                self.logger.info(f"Uploaded: {local_file_path} to {remote_file_path}")
-            except Exception as e:
-                self.logger.warning(f"Retry attempt for file upload: {local_file_path}")
-                raise FTPTransferError(f"Failed to upload file {local_file_path}: {e}")
-
-
-    @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
-    def download_file(self, remote_file_path, local_file_path, progress_callback=None, auto_release=True):
-        """
-        Downloads a file from the FTP server with retry and progress tracking.
-
-        :param remote_file_path: Path to the file on the FTP server.
-        :param local_file_path: Local path where the downloaded file will be stored.
-        :param progress_callback: Optional callback for progress tracking.
-        :param auto_release: Whether to release the FTP connection after the download.
-        :raises FTPTransferError: If the file download fails after retries.
-        """
-        self.logger.info(f"Starting download of {remote_file_path} to {local_file_path}")
-
+        self.logger.info(f"Starting upload of {local_path} to {remote_path}")
         try:
-            with self.ftp_connection(auto_release) as ftp:
-                # Open the local file in write-binary mode
-                with open(local_file_path, 'wb') as file:
-                    total_size = ftp.size(remote_file_path)
+            file_size = os.path.getsize(local_path)
 
-                    # Default progress tracking using tqdm if no callback is provided
-                    if progress_callback is None:
-                        with tqdm(total=total_size, unit='B', unit_scale=True, desc="Downloading") as pbar:
-                            def progress_callback(data):
-                                file.write(data)
-                                pbar.update(len(data))
+            # Open the local file in read-binary mode
+            with tqdm(total=file_size, unit='B', unit_scale=True, desc=f"Uploading {os.path.basename(local_path)}") as pbar:
+
+                # Default progress tracking using tqdm if no callback is provided
+                def update_progress(sent, total=None):
+                    pbar.update(sent - pbar.n)
+                # Custom progress callback
+                with self.get_connection(auto_release) as conn:
+                    if self.protocol == TransferProtocol.SFTP:
+                        conn['sftp'].put(
+                            local_path,
+                            remote_path,
+                            callback=update_progress if not progress_callback else progress_callback
+                        )
                     else:
-                        # Custom progress callback
-                        def progress_callback(data):
-                            file.write(data)
-                            if progress_callback:
-                                progress_callback(len(data))
+                        with open(local_path, 'rb') as file:
+                            conn.storbinary(
+                                f"STOR {remote_path}",
+                                file,
+                                callback=lambda block: update_progress(len(block))
+                            )
 
-                    # Download the file using RETR command
-                    ftp.retrbinary(f"RETR {remote_file_path}", progress_callback)
+            self.logger.info(f"Uploaded: {local_path} to {remote_path}")
 
-                # Check if the file was actually downloaded
-                local_file_size = os.path.getsize(local_file_path)
-                if local_file_size == 0:
-                    raise FTPTransferError(f"Downloaded file {local_file_path} is empty (0KB)")
-
-                self.logger.info(f"Downloaded: {remote_file_path} to {local_file_path}")
-
-        except ftplib.error_perm as e:
-            if str(e).startswith("550"):
-                self.logger.error(f"File not found on server: {remote_file_path}")
-            raise FTPTransferError(f"Failed to download file {remote_file_path}: {e}")
         except Exception as e:
-            raise FTPTransferError(f"Error during download: {e}")
+            raise FTPTransferError(f"Upload failed: {str(e)}")
 
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
-    def list_files(self, remote_path, only_files=True, auto_release=True):
+    def list_files(self, remote_path: str, only_files: bool = True, auto_release: bool = True) -> List[str]:
         """
         Lists the files in a specified directory on the FTP server.
 
@@ -289,18 +523,31 @@ class FTPClient:
         :param auto_release: Whether to release the FTP connection after the operation.
         :return: A list of filenames in the directory or an empty list if the directory is empty.
         :raises FTPTransferError: If listing files fails.
+
+        Returns:
+            List[str]: List of file names in the directory
         """
         try:
-            with self.ftp_connection(auto_release) as ftp:
-                files = ftp.nlst(remote_path)  # List files and directories in the directory
-                if only_files:
-                    files = [f for f in files if not self._is_directory(ftp, f)]  # Filter out directories
+            with self.get_connection(auto_release) as conn:  # Changed from ftp_connection
+                if self.protocol == TransferProtocol.SFTP:
+                    files = conn['sftp'].listdir(remote_path) # List files in the directory
+                    if only_files:
+                        files = [f for f in files if not self._is_directory_sftp(conn['sftp'], f)] # Filter out directories
+                else:
+                    files = conn.nlst(remote_path) # List files in the directory
+                    if only_files:
+                        files = [f for f in files if not self._is_directory(conn, f)] # Filter out directories
                 return files
-        except ftplib.error_perm as e:
-            if str(e).startswith("550"):  # Handle empty directory
-                self.logger.warning(f"Directory {remote_path} is empty or not accessible.")
-                return []  # Return empty list for empty directory
-            raise FTPTransferError(f"Failed to list files in {remote_path}: {e}")
+        except Exception as e:
+            self.logger.error(f"Failed to list files: {e}")
+            return []
+
+    def _is_directory_sftp(self, sftp, path):
+        """Check if path is directory for SFTP connections."""
+        try:
+            return stat.S_ISDIR(sftp.stat(path).st_mode)
+        except Exception:
+            return False
 
     def _is_directory(self, ftp, item):
         """
@@ -327,10 +574,20 @@ class FTPClient:
         :return: True if the directory exists, False otherwise.
         """
         try:
-            with self.ftp_connection(auto_release) as ftp:
-                ftp.cwd(remote_path)
-                return True
-        except ftplib.error_perm:
+            with self.get_connection(auto_release) as conn: # Changed from ftp_connection
+                if self.protocol == TransferProtocol.SFTP:
+                    try:
+                        mode = conn['sftp'].stat(remote_path).st_mode # Get the file mode
+                        return stat.S_ISDIR(mode)
+                    except Exception:
+                        return False
+                else:
+                    try:
+                        conn.cwd(remote_path) # Try to change to the directory
+                        return True
+                    except ftplib.error_perm:
+                        return False
+        except Exception:
             return False
 
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
@@ -409,35 +666,53 @@ class FTPClient:
             raise FTPTransferError(f"Failed to rename file from {old_remote_path} to {new_remote_path}: {e}")
 
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
-    def delete_file(self, remote_file_path, auto_release=True):
+    def delete_file(self, remote_path, auto_release=True):
         """
         Deletes a file from the FTP server.
 
-        :param remote_file_path: The path of the remote file to be deleted.
+        :param remote_path: The path of the remote file to be deleted.
         :param auto_release: Whether to release the FTP connection after the operation.
         :raises FTPTransferError: If the file deletion fails after retries.
         """
         try:
             with self.ftp_connection(auto_release) as ftp:
-                ftp.delete(remote_file_path)
-                self.logger.info(f"Deleted file: {remote_file_path}")
+                ftp.delete(remote_path)
+                self.logger.info(f"Deleted file: {remote_path}")
         except Exception as e:
-            raise FTPTransferError(f"Failed to delete file {remote_file_path}: {e}")
+            raise FTPTransferError(f"Failed to delete file {remote_path}: {e}")
 
-    def check_file_exists(self, remote_file_path, auto_release=True):
+    def check_file_exists(self, remote_path, auto_release=True):
         """
         Checks if a file exists on the FTP server.
 
-        :param remote_file_path: The path of the remote file to check.
-        :param auto_release: Whether to release the FTP connection after the operation.
-        :return: True if the file exists, False otherwise.
+        Args:
+            remote_path (str): The path of the remote file to check.
+            auto_release (bool): Whether to release the FTP connection after the operation.
+
+        Returns:
+            bool: True if the file exists, False otherwise.
         """
         try:
-            with self.ftp_connection(auto_release) as ftp:
-                files = ftp.nlst(os.path.dirname(remote_file_path))  # List files in the directory
-                return os.path.basename(remote_file_path) in files
+            with self.get_connection(auto_release) as conn:
+                if self.protocol == TransferProtocol.SFTP: # Check if file exists for SFTP connections
+                    try:
+                        mode = conn['sftp'].stat(remote_path).st_mode # Get the file mode
+                        return stat.S_ISREG(mode)
+                    except Exception:
+                        return False
+                else:
+                    try:
+                        size = conn.size(remote_path)
+                        return True
+                    except:
+                        try:
+                            # Check if file exists using MLST command
+                            conn.voidcmd(f"MLST {remote_path}")
+                            return True
+                        except:
+                            return False
         except Exception as e:
-            self.logger.error(f"Failed to check if file exists {remote_file_path}: {e}")
+            self.logger.error(f"Failed to check if file exists {remote_path}: {e}")
             return False
 
     @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
@@ -472,6 +747,49 @@ class FTPClient:
         except Exception as e:
             raise FTPTransferError(f"Failed to remove directory {remote_directory_path}: {e}")
 
+    @retry(wait_exponential_multiplier=1000, wait_exponential_max=10000, stop_max_attempt_number=5)
+    def remove_directory_recursive(self, remote_path: str, auto_release: bool = True) -> None:
+        """
+        Recursively removes a directory and all its contents from the FTP server.
+
+        Args:
+            remote_path: Path to the remote directory
+            auto_release: Whether to release the FTP connection after operation
+
+        Raises:
+            FTPTransferError: If directory removal fails
+        """
+        try:
+            with self.ftp_connection(auto_release) as ftp:
+                # List all items in directory
+                items = []
+                ftp.retrlines(f'LIST {remote_path}', items.append)
+
+                for item in items:
+                    # Parse item details (permissions, name, etc.)
+                    parts = item.split(None, 8)
+                    if len(parts) < 9:
+                        continue
+
+                    item_name = parts[8]
+                    full_path = f"{remote_path}/{item_name}"
+
+                    # Check if item is directory (starts with 'd' in permissions)
+                    if item[0] == 'd':
+                        # Recursively remove subdirectory
+                        self.remove_directory_recursive(full_path, auto_release=False)
+                    else:
+                        # Delete file
+                        ftp.delete(full_path)
+                        self.logger.info(f"Deleted file: {full_path}")
+
+                # Remove the empty directory
+                ftp.rmd(remote_path)
+                self.logger.info(f"Removed directory: {remote_path}")
+
+        except Exception as e:
+            raise FTPTransferError(f"Failed to recursively remove directory {remote_path}: {e}")
+
     def change_directory(self, remote_directory_path, auto_release=True):
         """
         Changes the current working directory on the FTP server.
@@ -500,41 +818,41 @@ class FTPClient:
                 hash_md5.update(chunk)
         return hash_md5.hexdigest()
 
-    def verify_file_integrity(self, local_file_path, remote_file_path, auto_release=True):
+    def verify_file_integrity(self, local_path, remote_path, auto_release=True):
         """
         Verifies the integrity of a file by comparing local and remote checksums or sizes.
 
-        :param local_file_path: The path of the local file.
-        :param remote_file_path: The path of the remote file on the FTP server.
+        :param local_path: The path of the local file.
+        :param remote_path: The path of the remote file on the FTP server.
         :param auto_release: Whether to release the FTP connection after the operation.
         :raises FTPTransferError: If verification fails.
         """
-        local_checksum = self.calculate_md5(local_file_path)
+        local_checksum = self.calculate_md5(local_path)
         try:
             with self.ftp_connection(auto_release) as ftp:
                 try:
                     # First, compare file sizes
-                    local_size = os.path.getsize(local_file_path)
-                    remote_size = ftp.size(remote_file_path)
+                    local_size = os.path.getsize(local_path)
+                    remote_size = ftp.size(remote_path)
                     if local_size != remote_size:
-                        raise FTPTransferError(f"File size mismatch for {local_file_path} and {remote_file_path}")
+                        raise FTPTransferError(f"File size mismatch for {local_path} and {remote_path}")
 
                     # Then, try to fetch the MD5 checksum if supported by the server
-                    remote_checksum = ftp.sendcmd(f'SITE MD5 {remote_file_path}')
+                    remote_checksum = ftp.sendcmd(f'SITE MD5 {remote_path}')
                     remote_checksum = remote_checksum.split(' ')[1]  # Parse the response
                 except Exception:
                     self.logger.warning("SITE MD5 command not supported. Downloading remote file for checksum comparison.")
-                    remote_file_path_temp = f"{local_file_path}.temp"
-                    self.download_file(remote_file_path, remote_file_path_temp)
-                    remote_checksum = self.calculate_md5(remote_file_path_temp)
-                    os.remove(remote_file_path_temp)  # Cleanup temporary file
+                    remote_path_temp = f"{local_path}.temp"
+                    self.download_file(remote_path, remote_path_temp)
+                    remote_checksum = self.calculate_md5(remote_path_temp)
+                    os.remove(remote_path_temp)  # Cleanup temporary file
 
                 if local_checksum != remote_checksum:
-                    raise FTPTransferError(f"Checksum mismatch for {local_file_path} and {remote_file_path}")
-                self.logger.info(f"Checksum verified for {local_file_path} and {remote_file_path}")
+                    raise FTPTransferError(f"Checksum mismatch for {local_path} and {remote_path}")
+                self.logger.info(f"Checksum verified for {local_path} and {remote_path}")
 
         except Exception as e:
-            raise FTPTransferError(f"Failed to verify integrity for {local_file_path}: {e}")
+            raise FTPTransferError(f"Failed to verify integrity for {local_path}: {e}")
 
     def parallel_upload(self, files):
         """
@@ -563,3 +881,12 @@ class FTPClient:
                     future.result()  # Wait for each download to complete
                 except FTPTransferError as e:
                     self.logger.error(f"Error during parallel download: {e}")
+
+    def get_server_features(self) -> List[str]:
+        """Get supported server features"""
+        with self.ftp_connection() as ftp:
+            return ftp.sendcmd('FEAT').split('\n')
+
+    def __del__(self):
+        """Ensure all connections are closed"""
+        self.disconnect()
